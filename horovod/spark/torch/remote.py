@@ -22,6 +22,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from horovod.spark.common import constants
+from horovod.spark.common.store import S3Store
 from horovod.spark.common.util import to_list
 from horovod.spark.torch.util import deserialize_fn
 
@@ -209,6 +210,12 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
             else:
                 reader_factory = make_batch_reader
 
+            # If store is S3Store,  Petastorm should also know the connection details which we can
+            # draw from the S3Store
+            s3_connection = None
+            if isinstance(store, S3Store):
+                s3_connection = store.get_s3_connection()
+
             # Petastorm: read data from the store with the correct shard for this rank
             # setting num_epochs=None will cause an infinite iterator
             # and enables ranks to perform training and validation with
@@ -222,6 +229,7 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                                 hdfs_driver=PETASTORM_HDFS_DRIVER,
                                 schema_fields=schema_fields,
                                 transform_spec=transform_spec,
+                                s3_connection=s3_connection,
                                 **reader_factory_kwargs) as train_reader:
                 with reader_factory(remote_store.val_data_path,
                                     num_epochs=None,
@@ -232,6 +240,7 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                                     hdfs_driver=PETASTORM_HDFS_DRIVER,
                                     schema_fields=schema_fields,
                                     transform_spec=transform_spec,
+                                    s3_connection=s3_connection,
                                     **reader_factory_kwargs) \
                     if should_validate else empty_batch_reader() as val_reader:
 

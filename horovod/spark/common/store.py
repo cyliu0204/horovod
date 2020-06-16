@@ -19,7 +19,8 @@ import os
 import re
 import shutil
 import tempfile
-
+import six
+from six.moves.urllib.parse import urlparse
 from distutils.version import LooseVersion
 
 import pyarrow as pa
@@ -43,6 +44,7 @@ class Store(object):
     needed. This is to support both parallel training processes using the same store on multiple DataFrames, as well
     as iterative training using the same DataFrame on different model variations.
     """
+
     def __init__(self):
         self._train_data_to_key = {}
         self._val_data_to_key = {}
@@ -186,8 +188,8 @@ class FilesystemStore(Store):
     def get_data_metadata_path(self, path):
         localized_path = self.get_localized_path(path)
         if localized_path.endswith('/'):
-            localized_path = localized_path[:-1] # Remove the slash at the end if there is one
-        metadata_cache = localized_path+"_cached_metadata.pkl"
+            localized_path = localized_path[:-1]  # Remove the slash at the end if there is one
+        metadata_cache = localized_path + "_cached_metadata.pkl"
         return metadata_cache
 
     def saving_runs(self):
@@ -228,6 +230,7 @@ class FilesystemStore(Store):
 
         def get_path(path):
             return prefix + path
+
         return get_path
 
     def _get_full_path_or_default(self, path, default_key):
@@ -290,6 +293,7 @@ class LocalStore(FilesystemStore):
         def fn(local_run_path):
             # No-op for LocalStore since the `local_run_path` will be the same as the run path
             assert run_path == local_run_path
+
         return fn
 
     @classmethod
@@ -417,6 +421,7 @@ class HDFSStore(FilesystemStore):
 
         def fn():
             return pa.hdfs.connect(**hdfs_kwargs)
+
         return fn
 
     def _check_url(self, url, prefix, path):
@@ -431,3 +436,169 @@ class HDFSStore(FilesystemStore):
     @classmethod
     def filesystem_prefix(cls):
         return cls.FS_PREFIX
+
+
+class S3Store(FilesystemStore):
+    """Uses S3 as a store of intermediate data and training artifacts.
+
+    Initialized from a `prefix_path` that can take one of the following forms:
+
+    1. "s3a:///user/test/horovod"
+
+
+    The full path (including prefix, host, and port) will be used for all reads and writes to HDFS through Spark. If
+    host and port are not provided, they will be omitted. If prefix is not provided (case 3), it will be prefixed to
+    the full path regardless.
+
+    The localized path (without prefix, host, and port) will be used for interaction with PyArrow. Parsed host and port
+    information will be used to initialize PyArrow `HadoopFilesystem` if they are not provided through the `host` and
+    `port` arguments to this initializer. These parameters will default to `default` and `0` if neither the path URL
+    nor the arguments provide this information.
+    """
+
+    FS_PREFIX = 's3a://'
+
+    def __init__(self, prefix_path, anon= False, use_ssl=False,
+                 access_key=None, access_secret=None, endpoint_url=None
+                 , extra_conf=None, temp_dir=None, *args, **kwargs):
+        self._temp_dir = temp_dir
+
+        self._parsed_dataset_url = None
+
+        if isinstance(prefix_path, six.string_types):
+            self._parsed_dataset_url = urlparse(prefix_path)
+        else:
+            self._parsed_dataset_url = prefix_path
+
+        self._url_prefix = self.FS_PREFIX
+        import os
+
+        env = os.environ
+
+        self._access_key = access_key or env.get('access_key')
+        self._secret = access_secret or env.get('access_secret')
+        self.endpoint_url = endpoint_url or env.get('endpoint_url')
+        self.use_ssl = use_ssl
+        self.anon = anon
+        self._client_kwargs = dict(endpoint_url=endpoint_url)
+
+        self._s3 = self._get_filesystem_fn()()
+
+        super(S3Store, self).__init__(prefix_path, *args, **kwargs)
+
+    def parse_url(self, url):
+        match = re.search(self.URL_PATTERN, url)
+        prefix = match.group(1)
+        host = match.group(2)
+
+        port = match.group(3)
+        if port is not None:
+            port = int(port)
+
+        path = match.group(4)
+        path_offset = match.start(4)
+        return prefix, host, port, path, path_offset
+
+    def path_prefix(self):
+        return self._url_prefix
+
+    def get_filesystem(self):
+        return self._s3
+
+    def get_local_output_dir_fn(self, run_id):
+        temp_dir = self._temp_dir
+
+        @contextlib.contextmanager
+        def local_run_path():
+            dirpath = tempfile.mkdtemp(dir=temp_dir)
+            try:
+                yield dirpath
+            finally:
+                shutil.rmtree(dirpath)
+
+        return local_run_path
+
+
+
+    def sync_fn(self, run_id):
+        class SyncState(object):
+            def __init__(self):
+                self.fs = None
+                self.uploaded = {}
+
+        state = SyncState()
+        get_filesystem = self._get_filesystem_fn()
+        s3_root_path = self.get_run_path(run_id)
+
+        def fn(local_run_path):
+            if state.fs is None:
+                state.fs = get_filesystem()
+
+            s3 = state.fs
+            uploaded = state.uploaded
+            # We need to swap this prefix from the local path with the absolute path, +1 due to
+            # including the trailing slash
+            prefix = len(local_run_path) + 1
+
+            for local_dir, dirs, files in os.walk(local_run_path):
+                s3_dir = os.path.join(s3_root_path, local_dir[prefix:])
+                for file in files:
+                    local_path = os.path.join(local_dir, file)
+                    modified_ts = int(os.path.getmtime(local_path))
+
+                    if local_path in uploaded:
+                        last_modified_ts = uploaded.get(local_path)
+                        if modified_ts <= last_modified_ts:
+                            continue
+
+                    s3_path = os.path.join(s3_dir, file)
+                    # with open(local_path, 'rb') as f:
+                    s3.upload(local_path, s3_path)
+                    uploaded[local_path] = modified_ts
+
+        return fn
+
+    def _get_filesystem_fn(self):
+
+        def fn():
+            try:
+                import s3fs
+            except ImportError:
+                raise ValueError('Must have s3fs installed in order to use datasets on s3. '
+                                 'Please install s3fs and try again.')
+
+            if not self._parsed_dataset_url.netloc:
+                raise ValueError('URLs must be of the form s3://bucket/path')
+
+            fs = s3fs.S3FileSystem(anon=False, key=self._access_key, secret=self._secret,
+                                   client_kwargs=self._client_kwargs)
+            self._filesystem = fs
+            return self._filesystem
+
+        return fn
+
+    def _check_url(self, url, prefix, path):
+        print('_check_url: {}'.format(prefix))
+        if prefix is not None and prefix != self.FS_PREFIX:
+            raise ValueError('Mismatched s3a namespace for URL: {}. Found {} but expected {}'
+                             .format(url, prefix, self.FS_PREFIX))
+
+        if not path:
+            raise ValueError('Failed to parse path from URL: {}'.format(url))
+
+    def get_s3_connection(self):
+        return Connection(anon=self.anon, use_ssl=self.use_ssl, key=self._access_key, secret=self._secret,
+                          endpoint_url=self.endpoint_url)
+
+    @classmethod
+    def filesystem_prefix(cls):
+        return cls.FS_PREFIX
+
+
+class Connection:
+    def __init__(self, key, secret, endpoint_url, use_ssl, anon):
+        self.key = key
+        self.secret = secret
+        self.endpoint_url = endpoint_url
+        self.use_ssl = use_ssl
+        self.anon = anon
