@@ -458,7 +458,7 @@ class S3Store(FilesystemStore):
 
     FS_PREFIX = 's3a://'
 
-    def __init__(self, prefix_path, anon= False, use_ssl=False,
+    def __init__(self, prefix_path, anon=False, use_ssl=False,
                  access_key=None, access_secret=None, endpoint_url=None
                  , extra_conf=None, temp_dir=None, *args, **kwargs):
         self._temp_dir = temp_dir
@@ -517,8 +517,6 @@ class S3Store(FilesystemStore):
                 shutil.rmtree(dirpath)
 
         return local_run_path
-
-
 
     def sync_fn(self, run_id):
         class SyncState(object):
