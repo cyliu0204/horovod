@@ -143,6 +143,8 @@ class Store(object):
     def create(prefix_path, *args, **kwargs):
         if HDFSStore.matches(prefix_path):
             return HDFSStore(prefix_path, *args, **kwargs)
+        elif S3Store.matches(prefix_path):
+            return S3Store(prefix_path, *args, **kwargs)
         else:
             return LocalStore(prefix_path, *args, **kwargs)
 
@@ -566,7 +568,7 @@ class S3Store(FilesystemStore):
                                  'Please install s3fs and try again.')
 
             if not self._parsed_dataset_url.netloc:
-                raise ValueError('URLs must be of the form s3://bucket/path')
+                raise ValueError('URLs must be of the form s3a://bucket/path')
 
             fs = s3fs.S3FileSystem(anon=False, key=self._access_key, secret=self._secret,
                                    client_kwargs=self._client_kwargs)
@@ -584,16 +586,16 @@ class S3Store(FilesystemStore):
         if not path:
             raise ValueError('Failed to parse path from URL: {}'.format(url))
 
-    def get_s3_connection(self):
-        return Connection(anon=self.anon, use_ssl=self.use_ssl, key=self._access_key, secret=self._secret,
-                          endpoint_url=self.endpoint_url)
+    def get_s3_configuration(self):
+        return Configuration(anon=self.anon, use_ssl=self.use_ssl, key=self._access_key, secret=self._secret,
+                             endpoint_url=self.endpoint_url)
 
     @classmethod
     def filesystem_prefix(cls):
         return cls.FS_PREFIX
 
 
-class Connection:
+class Configuration:
     def __init__(self, key, secret, endpoint_url, use_ssl, anon):
         self.key = key
         self.secret = secret

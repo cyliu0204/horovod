@@ -25,6 +25,7 @@ from distutils.version import LooseVersion
 
 from horovod.spark.common import constants
 from horovod.run.common.util import codec
+from horovod.spark.common.store import S3Store
 
 
 PETASTORM_HDFS_DRIVER = constants.PETASTORM_HDFS_DRIVER
@@ -75,6 +76,12 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
     # Storage
     store = estimator.getStore()
     remote_store = store.to_remote(run_id, dataset_idx)
+
+    # If store is S3Store,  Petastorm should also know the connection details which we can
+    # draw from the S3Store
+    s3_configuration = None
+    if isinstance(store, S3Store):
+        s3_configuration = store.get_s3_configuration()
 
     def SyncCallback(root_path, sync_to_store_fn, keras):
         class _SyncCallback(keras.callbacks.Callback):
@@ -189,6 +196,7 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
                                 hdfs_driver=PETASTORM_HDFS_DRIVER,
                                 schema_fields=schema_fields,
                                 transform_spec=transform_spec,
+                                s3_configuration=s3_configuration,
                                 **reader_factory_kwargs) as train_reader:
                 with reader_factory(remote_store.val_data_path,
                                     num_epochs=None,
@@ -198,6 +206,7 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
                                     shard_count=hvd.size(),
                                     hdfs_driver=PETASTORM_HDFS_DRIVER,
                                     schema_fields=schema_fields,
+                                    s3_configuration=s3_configuration,
                                     transform_spec=transform_spec,
                                     **reader_factory_kwargs) \
                     if should_validate else empty_batch_reader() as val_reader:
